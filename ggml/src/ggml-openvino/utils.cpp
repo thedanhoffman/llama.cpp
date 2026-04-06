@@ -147,15 +147,14 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
                             try {
                                 state_name = r_ctx->kv_state_input_name_map.at(state.get_name());
                             } catch (...) {
-                                GGML_LOG_ERROR(
-                                    "GGML OpenVINO backend stateful inference failed: no input found for the state\n");
+                                GGML_LOG_ERROR("GGML OpenVINO backend stateful inference failed: no input found for the state\n");
                                 return GGML_STATUS_FAILED;
                             }
                             auto kv_tensor = get_ov_input_tensor(ggml_decoder, state_name);
-                            kv_tensor.set_shape({state_tensor_shape[0], kv_tensor.get_shape()[2], state_tensor_shape[2],
-                                                 state_tensor_shape[3]});
-                            state_tensor = kv_tensor;
-                            state_tensor_shape = state_tensor.get_shape();
+                            kv_tensor.set_shape({state_tensor_shape[0], kv_tensor.get_shape()[2],
+                                                 state_tensor_shape[2], state_tensor_shape[3]});
+                           state_tensor = kv_tensor;
+                           state_tensor_shape = state_tensor.get_shape();
                         }
                         ov::Coordinate begin = {0, 0, 0, 0};
                         ov::Coordinate end = {state_tensor_shape[0], static_cast<uint32_t>(pos_data[0]),
@@ -176,8 +175,7 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
             std::shared_ptr<ov::Model> model;
             auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph);
 
-            ggml_decoder =
-                std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights, is_static, stateful);
+            ggml_decoder = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights, is_static, stateful);
             decoder_end_time = ggml_time_us();
 
             auto input_model = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder);
@@ -220,8 +218,8 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
                 auto pos_shape = ggml_decoder->get_shape(inp_pos);
                 r_ctx->stateful_kv_size = pos_shape[3];
                 const auto kv_param_res_names = ggml_decoder->get_kv_param_res_names();
-                for (const auto & pair : kv_param_res_names) {
-                    r_ctx->kv_state_input_name_map[pair.first + pair.second] = pair.first;
+                for (const auto& pair : kv_param_res_names) {
+                    r_ctx->kv_state_input_name_map[pair.first+pair.second] = pair.first;
                 }
             }
         }
@@ -699,61 +697,48 @@ size_t checksum(const void * data, size_t size) {
 }
 
 void print_input_tensor_info(const std::string & name, const ov::Tensor & tensor) {
-    std::cout << "Input name: " << name << ", Input shape: " << tensor.get_shape();
-    const void * addr = nullptr;
-    try {
-        addr = tensor.data();
-    } catch (const ov::Exception & e) {
-        std::cout << ", Address: <remote tensor>";
-    }
-    if (addr) {
-        std::cout << ", Address: " << addr;
-    }
-    std::cout << std::endl;
-    try {
-        switch (tensor.get_element_type()) {
-        case ov::element::f32: {
-            if (name.find("self_kq_mask") == std::string::npos) {
-                std::cout << *(tensor.data<float>()) << std::endl;
-            } else {
-                size_t rows = tensor.get_shape()[2];
-                size_t cols = tensor.get_shape()[3];
-                auto * data = tensor.data<float>();
-                for (size_t i = 0; i < rows; ++i) {
-                    for (size_t j = 0; j < cols; ++j) {
-                        float val = data[i * cols + j];
-                        if (std::isinf(val) && val < 0) {
-                            std::cout << std::setw(5) << "-inf";
-                        } else {
-                            std::cout << std::setw(5) << val;
-                        }
+    std::cout << "Input name: " << name << ", Input shape: " << tensor.get_shape() << ", Address: " << tensor.data()
+              << std::endl;
+    switch (tensor.get_element_type()) {
+    case ov::element::f32: {
+        if (name.find("self_kq_mask") == std::string::npos) {
+            std::cout << *(tensor.data<float>()) << std::endl;
+        } else {
+            size_t rows = tensor.get_shape()[2];
+            size_t cols = tensor.get_shape()[3];
+            auto * data = tensor.data<float>();
+            for (size_t i = 0; i < rows; ++i) {
+                for (size_t j = 0; j < cols; ++j) {
+                    float val = data[i * cols + j];
+                    if (std::isinf(val) && val < 0) {
+                        std::cout << std::setw(5) << "-inf";
+                    } else {
+                        std::cout << std::setw(5) << val;
                     }
-                    std::cout << std::endl;
                 }
+                std::cout << std::endl;
             }
+        }
 
-            break;
+        break;
+    }
+    case ov::element::f16:
+        std::cout << *(tensor.data<ov::float16>()) << std::endl;
+        break;
+    case ov::element::i32:
+        for (size_t i = 0; i < tensor.get_size(); ++i) {
+            std::cout << tensor.data<int32_t>()[i] << " ";
         }
-        case ov::element::f16:
-            std::cout << *(tensor.data<ov::float16>()) << std::endl;
-            break;
-        case ov::element::i32:
-            for (size_t i = 0; i < tensor.get_size(); ++i) {
-                std::cout << tensor.data<int32_t>()[i] << " ";
-            }
-            std::cout << std::endl;
-            break;
-        case ov::element::i64:
-            for (size_t i = 0; i < tensor.get_size(); ++i) {
-                std::cout << tensor.data<int64_t>()[i] << " ";
-            }
-            std::cout << std::endl;
-            break;
-        default:
-            break;
+        std::cout << std::endl;
+        break;
+    case ov::element::i64:
+        for (size_t i = 0; i < tensor.get_size(); ++i) {
+            std::cout << tensor.data<int64_t>()[i] << " ";
         }
-    } catch (const ov::Exception & e) {
-        std::cout << " (data() not available for remote tensor)" << std::endl;
+        std::cout << std::endl;
+        break;
+    default:
+        break;
     }
 }
 
