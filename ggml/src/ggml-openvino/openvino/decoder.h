@@ -66,6 +66,8 @@ public:
 
     virtual bool is_stateful() const = 0;
 
+    virtual int get_ctx_size() const = 0;
+
     virtual int is_swa_layer(int layer) const = 0;
 };
 

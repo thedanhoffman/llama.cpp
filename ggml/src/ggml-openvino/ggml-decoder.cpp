@@ -28,6 +28,45 @@
 #include <openvino/core/type/element_type.hpp>
 #include <openvino/core/type/float16.hpp>
 #include <openvino/op/constant.hpp>
+
+namespace {
+
+bool has_upper_bound(const ov::PartialShape & shape) {
+    for (const auto & dim : shape) {
+        if (dim.is_dynamic() && dim.get_max_length() == -1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool has_reasonable_upper_bound(const ov::PartialShape & shape, int64_t max_reasonable = 512 * 1024) {
+    for (const auto & dim : shape) {
+        if (dim.is_dynamic()) {
+            auto max_len = dim.get_max_length();
+            if (max_len > max_reasonable) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void assert_has_upper_bound(const ov::PartialShape & shape, const std::string & context) {
+    if (shape.is_dynamic() && !has_upper_bound(shape)) {
+        fprintf(stderr, "ASSERTION FAILED: PartialShape %s lacks upper bound: %s\n", context.c_str(),
+                shape.to_string().c_str());
+        assert(false && "PartialShape lacks upper bound");
+    }
+    if (shape.is_dynamic() && !has_reasonable_upper_bound(shape)) {
+        fprintf(stderr, "ASSERTION FAILED: PartialShape %s has unreasonable upper bound: %s\n", context.c_str(),
+                shape.to_string().c_str());
+        assert(false && "PartialShape has unreasonable upper bound");
+    }
+}
+
+}  // namespace
+
 #include <openvino/op/convert.hpp>
 #include <openvino/op/parameter.hpp>
 #include <openvino/runtime/tensor.hpp>
@@ -332,28 +371,37 @@ void GgmlOvDecoder::validate_cgraph() const {
 
 ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op, const ggml_tensor * input) const {
     if (m_naive) {
-        return input!= nullptr ? ov::PartialShape{get_shape(input)} : ov::PartialShape{get_shape(op)};
+        auto shape = input != nullptr ? ov::PartialShape{get_shape(input)} : ov::PartialShape{get_shape(op)};
+        assert_has_upper_bound(shape, "get_graph_input_shape naive");
+        return shape;
     }
     auto name = std::string(input->name);
     ov::PartialShape input_shape;
 
     if (is_inp_tok(input, op) || is_inp_pos(input, op)) {
         // tokens or positions
-        int len = m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : -1;
-        input_shape = ov::PartialShape{1, 1, 1, len};
+        if (m_is_static) {
+            int len = m_is_prefill ? m_prefill_chunk_size : 1;
+            input_shape = ov::PartialShape{1, 1, 1, len};
+        } else {
+            input_shape = ov::PartialShape{1, 1, 1, ov::Dimension(1, m_model_params.ctx)};
+        }
 
     } else if (is_output_idx(input, op)) {
         // output index
-        input_shape = ov::PartialShape{1, 1, 1, m_is_static ? m_compute_params.output_len : -1};
+        input_shape =
+            ov::PartialShape{1, 1, 1, m_is_static ? m_compute_params.output_len : ov::Dimension(1, m_model_params.ctx)};
 
     } else if (is_inp_mask(input, op)) {
         // mask
         if (m_is_static) {
             input_shape = ov::PartialShape{1, 1, m_is_prefill ? m_prefill_chunk_size : 1, m_model_params.ctx};
         } else if (m_is_stateful) {
-            input_shape = ov::PartialShape{1, 1, -1, -1};
+            input_shape =
+                ov::PartialShape{1, 1, ov::Dimension(1, m_model_params.ctx), ov::Dimension(1, m_model_params.ctx)};
         } else {
-            input_shape = ov::PartialShape{-1, 1, -1, -1};
+            input_shape = ov::PartialShape{ov::Dimension(1, m_model_params.ctx), 1,
+                                           ov::Dimension(1, m_model_params.ctx), ov::Dimension(1, m_model_params.ctx)};
         }
 
     } else if (is_kvcache(input, op)) {
@@ -361,7 +409,7 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op, co
         input_shape = ov::PartialShape{get_shape(input)};
         if (!m_is_static) {
             // do not fix ctx size to make llama-bench work across test params
-            input_shape[2] = -1;
+            input_shape[2] = ov::Dimension(1, m_model_params.ctx);
         }
         if (is_stateful()) {
             // Convert stateless KV cache layout [1, 1, seq, n_heads_kv * head_size]
@@ -369,18 +417,24 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op, co
             assert(input_shape.size() == 4 && input_shape[0] == 1 && input_shape[1] == 1 &&
                    input_shape[2].is_dynamic() &&
                    input_shape[3] == (m_model_params.n_heads_kv * m_model_params.head_size));
-            input_shape = {input_shape[0], ov::Dimension::dynamic(), m_model_params.n_heads_kv,
+            input_shape = {input_shape[0], ov::Dimension(1, m_model_params.ctx), m_model_params.n_heads_kv,
                            m_model_params.head_size};
+            assert_has_upper_bound(input_shape, "kvcache stateful");
         }
 
     } else if (is_kv_idx(input, op)) {
         // kv update index
-        int len = m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : -1;
-        input_shape = ov::PartialShape{1, 1, 1, len};
+        if (m_is_static) {
+            int len = m_is_prefill ? m_prefill_chunk_size : 1;
+            input_shape = ov::PartialShape{1, 1, 1, len};
+        } else {
+            input_shape = ov::PartialShape{1, 1, 1, ov::Dimension(1, m_model_params.ctx)};
+        }
 
     } else {
         input_shape = ov::PartialShape{get_shape(input)};
     }
+    assert_has_upper_bound(input_shape, "get_graph_input_shape: " + std::string(input ? input->name : "null"));
     return input_shape;
 }
 
@@ -843,7 +897,9 @@ ov::element::Type GgmlOvDecoder::get_ov_type(const ggml_tensor * tensor) {
 }
 
 ov::PartialShape GgmlOvDecoder::get_input_shape(int node_idx, const std::string & name) const {
-    return ov::PartialShape(get_shape(m_node_info_list[node_idx].node_inputs.at(name)));
+    auto shape = ov::PartialShape(get_shape(m_node_info_list[node_idx].node_inputs.at(name)));
+    assert_has_upper_bound(shape, "get_input_shape node " + std::to_string(node_idx) + " " + name);
+    return shape;
 }
 
 std::vector<size_t> GgmlOvDecoder::get_input_stride(int node_idx, const std::string & name) const {
@@ -868,7 +924,9 @@ std::vector<std::string> GgmlOvDecoder::get_input_names(int node_idx) const {
 
 ov::PartialShape GgmlOvDecoder::get_output_shape(int node_idx) const {
     auto * ggml_tensor = m_node_info_list[node_idx].node_output;
-    return ov::PartialShape(get_shape(ggml_tensor));
+    auto shape = ov::PartialShape(get_shape(ggml_tensor));
+    assert_has_upper_bound(shape, "get_output_shape node " + std::to_string(node_idx));
+    return shape;
 }
 
 ov::element::Type GgmlOvDecoder::get_output_type(const int node_idx) const {

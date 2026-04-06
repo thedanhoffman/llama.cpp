@@ -7,10 +7,12 @@
 #include "pass/mark_decompression_convert_constant_folding.h"
 #include "pass/squeeze_matmul.h"
 
+#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <openvino/core/dimension.hpp>
 #include <openvino/core/node.hpp>
 #include <openvino/op/add.hpp>
 #include <openvino/op/broadcast.hpp>
@@ -261,6 +263,79 @@ std::shared_ptr<Model> TranslateSession::apply_transformations(std::shared_ptr<M
             manager.register_pass<pass::SqueezeMatmul>();
         }
         manager.run_passes(model);
+
+        int max_ctx_size = ggml_model_decoder->get_ctx_size();
+        int unbounded_count = 0;
+
+        // Fix ALL nodes after all passes are done - don't call validate after as it undoes our work
+        for (auto& param : model->get_parameters()) {
+            for (size_t output_idx = 0; output_idx < param->get_output_size(); ++output_idx) {
+                auto partial_shape = param->get_output_partial_shape(output_idx);
+                bool modified = false;
+                for (size_t j = 0; j < partial_shape.size(); ++j) {
+                    if (partial_shape[j].is_dynamic()) {
+                        auto max_len = partial_shape[j].get_max_length();
+                        if (max_len == -1) {
+                            partial_shape[j] = ov::Dimension(1, max_ctx_size);
+                            modified = true;
+                            unbounded_count++;
+                        }
+                    }
+                }
+                if (modified) {
+                    param->set_output_type(output_idx, param->get_output_element_type(output_idx), partial_shape);
+                }
+            }
+        }
+
+        for (auto& node : model->get_ops()) {
+            for (size_t output_idx = 0; output_idx < node->get_output_size(); ++output_idx) {
+                auto partial_shape = node->get_output_partial_shape(output_idx);
+                bool modified = false;
+                for (size_t j = 0; j < partial_shape.size(); ++j) {
+                    if (partial_shape[j].is_dynamic()) {
+                        auto max_len = partial_shape[j].get_max_length();
+                        if (max_len == -1) {
+                            partial_shape[j] = ov::Dimension(1, max_ctx_size);
+                            modified = true;
+                            unbounded_count++;
+                        }
+                    }
+                }
+                if (modified) {
+                    node->set_output_type(output_idx, node->get_output_element_type(output_idx), partial_shape);
+                }
+            }
+        }
+        int unbounded_after = 0;
+        for (auto& node : model->get_ops()) {
+            for (size_t output_idx = 0; output_idx < node->get_output_size(); ++output_idx) {
+                auto partial_shape = node->get_output_partial_shape(output_idx);
+                if (partial_shape.is_dynamic()) {
+                    for (size_t j = 0; j < partial_shape.size(); ++j) {
+                        if (partial_shape[j].is_dynamic() && partial_shape[j].get_max_length() == -1) {
+                            fprintf(stderr, "ERROR: Node %s output %zu dimension %zu still unbounded: %s\n",
+                                    node->get_friendly_name().c_str(), output_idx, j,
+                                    partial_shape[j].to_string().c_str());
+                            unbounded_after++;
+                        }
+                    }
+                }
+            }
+        }
+        if (unbounded_after > 0) {
+            fprintf(stderr, "ERROR: Found %d unbounded dimensions after fix!\n", unbounded_after);
+            assert(false && "Unbounded dimensions remain after fix");
+        }
+
+        std::cerr << "=== Fixed " << unbounded_count << " unbounded dimensions, verified " << unbounded_after << " remain ===" << std::endl;
+
+        for (size_t i = 0; i < model->get_output_size(); ++i) {
+            auto output = model->output(i);
+            std::cerr << "Final output " << i << ": " << output.get_node_shared_ptr()->get_friendly_name() 
+                      << " shape: " << output.get_partial_shape() << std::endl;
+        }
+
         if (ggml_model_decoder->is_stateful()) {
             auto output_names = ggml_model_decoder->get_model_output_names();
             std::map<std::string, int> model_output_indexes;
